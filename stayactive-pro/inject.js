@@ -4,36 +4,71 @@
  * Runs in the MAIN world at document_start so our overrides beat any
  * page-level listener registration.  MAIN world means NO chrome.* APIs.
  *
- * Config is delivered via a data attribute written by the companion
- * isolated-world relay script (relay.js) before this script executes.
- * The relay reads chrome.storage.local and stamps:
- *   document.documentElement.dataset.saConfig = JSON.stringify(config)
- * Because inject.js runs at document_start, document.documentElement
- * already exists (the parser creates it before any script runs).
+ * Config delivery (WHY postMessage, not a DOM attribute):
+ *   - A DOM data-attribute would be written by relay.js only AFTER an
+ *     async chrome.storage.local.get resolves, which is always AFTER
+ *     this synchronous script has already run — so we'd always read
+ *     empty config.  Using postMessage lets relay.js push config to us
+ *     whenever it is ready, and a handshake (SA_READY / SA_CONFIG) makes
+ *     the delivery reliable regardless of which script starts first.
+ *   - A data-attribute also leaks the extension's presence to the page;
+ *     a postMessage with a private __saType key is less conspicuous.
+ *
+ * Sections 1–6 (core spoofing) run immediately — no config needed,
+ * because every site that has inject.js registered is already enabled.
+ * Sections 7–8 (extras) run inside startExtras(cfg) called once config
+ * arrives via the SA_CONFIG message.
  */
 
 (function stayActiveProInject() {
   'use strict';
 
   /* ─────────────────────────────────────────────────────────────────
-   * 1. Read config injected by the isolated-world relay script.
-   *    Falls back to a safe default (everything enabled) if missing.
+   * HANDSHAKE — register the SA_CONFIG listener and post SA_READY.
+   *
+   * WHY register first, then post?  If relay.js is already loaded and
+   * waiting, it will reply to SA_READY immediately (synchronously in the
+   * microtask queue).  If relay.js loads later, it will see our SA_READY
+   * in its own listener and post SA_CONFIG once storage is read.
+   * Either way, startExtras runs exactly once thanks to extrasStarted.
    * ───────────────────────────────────────────────────────────────── */
-  let cfg = {
-    spoofVisibility: true,
-    antiIdle: false,
-    keepAliveAudio: false,
-    fakeActivity: false,
-  };
 
-  try {
-    const raw = document.documentElement.dataset.saConfig;
-    if (raw) {
-      cfg = Object.assign(cfg, JSON.parse(raw));
+  // Guard: run startExtras at most once per page load even if two
+  // SA_CONFIG messages somehow arrive (shouldn't happen, but be safe).
+  let extrasStarted = false;
+
+  window.addEventListener('message', function onSaConfig(event) {
+    // Validate: must come from same window, be a plain object, have our tag.
+    if (
+      event.source !== window ||
+      !event.data ||
+      typeof event.data !== 'object' ||
+      event.data.__saType !== 'SA_CONFIG'
+    ) {
+      return;
     }
-  } catch (_) {
-    // Malformed JSON or missing — proceed with defaults.
-  }
+
+    // Parse the JSON string safely (relay sends cfg as a string so it
+    // crosses the MAIN/ISOLATED world boundary without object identity issues).
+    let cfg;
+    try {
+      cfg = JSON.parse(event.data.cfg);
+    } catch (_) {
+      // Malformed JSON — skip; core spoofing is already running.
+      return;
+    }
+
+    // Single-run guard (WHY: storage reads or relay restarts could fire
+    // a second SA_CONFIG; we must not double-start timers/AudioContexts).
+    if (extrasStarted) return;
+    extrasStarted = true;
+
+    startExtras(cfg);
+  });
+
+  // Tell relay.js we are ready.  If relay.js loaded first and already has
+  // config cached, it will re-post SA_CONFIG in response to this message.
+  window.postMessage({ __saType: 'SA_READY' }, '*');
 
   /* ─────────────────────────────────────────────────────────────────
    * 2. Native-code toString spoofing helper.
@@ -77,225 +112,251 @@
    *    Some frameworks re-query the descriptor via
    *    Object.getPrototypeOf(document), so patching the prototype
    *    is more robust.  configurable:true lets test code reset it.
+   *
+   *    WHY unconditional (no cfg guard)?  Every site that has inject.js
+   *    registered is already enabled — the background only registers the
+   *    script when the user turns the site on.  So core spoofing is
+   *    always appropriate here.
    * ───────────────────────────────────────────────────────────────── */
-  if (cfg.spoofVisibility) {
-    const visibilityProps = {
-      hidden:                 { value: false,     nativeStr: 'function get hidden() { [native code] }' },
-      webkitHidden:           { value: false,     nativeStr: 'function get webkitHidden() { [native code] }' },
-      visibilityState:        { value: 'visible', nativeStr: 'function get visibilityState() { [native code] }' },
-      webkitVisibilityState:  { value: 'visible', nativeStr: 'function get webkitVisibilityState() { [native code] }' },
-    };
+  const visibilityProps = {
+    hidden:                { value: false,     nativeStr: 'function get hidden() { [native code] }' },
+    webkitHidden:          { value: false,     nativeStr: 'function get webkitHidden() { [native code] }' },
+    visibilityState:       { value: 'visible', nativeStr: 'function get visibilityState() { [native code] }' },
+    webkitVisibilityState: { value: 'visible', nativeStr: 'function get webkitVisibilityState() { [native code] }' },
+  };
 
-    for (const [prop, meta] of Object.entries(visibilityProps)) {
-      const getter = () => meta.value;
-      registerNativeString(getter, meta.nativeStr);
+  for (const [prop, meta] of Object.entries(visibilityProps)) {
+    const getter = () => meta.value;
+    registerNativeString(getter, meta.nativeStr);
 
-      Object.defineProperty(Document.prototype, prop, {
-        get: getter,
-        configurable: true,  // Allow test code / other extensions to override.
-        enumerable: true,
-      });
-    }
-
-    /* document.hasFocus() → always true */
-    const hasFocusFn = () => true;
-    registerNativeString(hasFocusFn, 'function hasFocus() { [native code] }');
-    Document.prototype.hasFocus = hasFocusFn;
-
-    /* ───────────────────────────────────────────────────────────────
-     * 4. Block visibility/focus events at capture phase on window.
-     *
-     *    WHY capture phase?  Capture fires before bubble, so we can
-     *    call stopImmediatePropagation() before any page handler sees
-     *    the event.  We only block when target is window, document, or
-     *    <html> — never on normal elements like <input> or <button>
-     *    so that form blur behaviour is untouched.
-     * ─────────────────────────────────────────────────────────────── */
-    const BLOCKED_EVENTS = [
-      'visibilitychange',
-      'webkitvisibilitychange',
-      'blur',
-      'mouseleave',
-      'pagehide',
-      'freeze',
-    ];
-
-    // Counts for the event log feature (sent via postMessage to relay).
-    const blockedCounts = {};
-    BLOCKED_EVENTS.forEach(e => { blockedCounts[e] = 0; });
-
-    function blockHandler(event) {
-      const t = event.target;
-      // Only intercept top-level targets — not inputs, buttons, etc.
-      if (t === window || t === document || t === document.documentElement) {
-        blockedCounts[event.type] = (blockedCounts[event.type] || 0) + 1;
-        event.stopImmediatePropagation();
-        // Don't call preventDefault() — some events have side-effects we
-        // still want (e.g., pagehide for bfcache).
-      }
-    }
-
-    for (const evtName of BLOCKED_EVENTS) {
-      window.addEventListener(evtName, blockHandler, true /* capture */);
-    }
-
-    /* ───────────────────────────────────────────────────────────────
-     * 5. Neutralise property-assignment handlers.
-     *
-     *    Some sites do: window.onblur = function() { pauseVideo(); }
-     *    We intercept the setter and silently discard the assignment.
-     * ─────────────────────────────────────────────────────────────── */
-    const noop = () => {};
-
-    function neutraliseSetter(obj, prop) {
-      Object.defineProperty(obj, prop, {
-        get: () => null,
-        set: noop,
-        configurable: true,
-        enumerable: true,
-      });
-    }
-
-    neutraliseSetter(window,   'onblur');
-    neutraliseSetter(window,   'onpagehide');
-    neutraliseSetter(document, 'onvisibilitychange');
-    neutraliseSetter(document, 'onwebkitvisibilitychange');
-
-    /* ───────────────────────────────────────────────────────────────
-     * 6. Report blocked event counts back to the relay script.
-     *
-     *    We cannot use chrome.runtime.sendMessage from MAIN world, so
-     *    we post a structured message on window.  The isolated-world
-     *    relay script (which CAN use chrome.*) listens and forwards it.
-     *    Throttled to once per 2 s to avoid spam.
-     * ─────────────────────────────────────────────────────────────── */
-    let reportTimer = null;
-
-    function scheduleReport() {
-      if (reportTimer) return;
-      reportTimer = setTimeout(() => {
-        reportTimer = null;
-        window.postMessage({
-          __saType: 'BLOCKED_COUNTS',
-          counts: Object.assign({}, blockedCounts),
-        }, '*');
-      }, 2000);
-    }
-
-    // Patch the block handler to also trigger a report.
-    const origBlockHandler = blockHandler;
-    BLOCKED_EVENTS.forEach(evtName => {
-      // (already registered above — scheduleReport called inside handler closure)
+    Object.defineProperty(Document.prototype, prop, {
+      get: getter,
+      configurable: true,  // Allow test code / other extensions to override.
+      enumerable: true,
     });
+  }
 
-    // We need a slightly different setup: attach the scheduler inside
-    // a second capture listener so we don't disturb the stop-propagation.
-    window.addEventListener('visibilitychange', scheduleReport, true);
-    window.addEventListener('blur',             scheduleReport, true);
-    window.addEventListener('mouseleave',       scheduleReport, true);
-    window.addEventListener('pagehide',         scheduleReport, true);
-  } // end if (cfg.spoofVisibility)
+  /* document.hasFocus() → always true */
+  const hasFocusFn = () => true;
+  registerNativeString(hasFocusFn, 'function hasFocus() { [native code] }');
+  Document.prototype.hasFocus = hasFocusFn;
 
   /* ─────────────────────────────────────────────────────────────────
-   * 7. Anti-idle / fake activity  (cfg.antiIdle)
+   * 4. Block visibility/focus events at capture phase on window.
    *
-   *    Dispatches synthetic mousemove + scroll on a random 20–40 s
-   *    interval so the OS/browser idle timer does not tick up.
-   *    Requests a Screen Wake Lock and re-acquires it when released.
+   *    WHY capture phase?  Capture fires before bubble, so we can
+   *    call stopImmediatePropagation() before any page handler sees
+   *    the event.  We only block when target is window, document, or
+   *    <html> — never on normal elements like <input> or <button>
+   *    so that form blur behaviour is untouched.
    * ───────────────────────────────────────────────────────────────── */
-  if (cfg.antiIdle || cfg.fakeActivity) {
-    function randomBetween(min, max) {
-      return Math.floor(Math.random() * (max - min + 1)) + min;
+  const BLOCKED_EVENTS = [
+    'visibilitychange',
+    'webkitvisibilitychange',
+    'blur',
+    'mouseleave',
+    'pagehide',
+    'freeze',
+  ];
+
+  // Pending delta counts for the event log feature.
+  // WHY deltas (not cumulative totals)?  background.js ADDS each incoming
+  // message to storage — so if we sent running totals, every event would
+  // be counted twice (once in the flush and again on the next flush).
+  // Sending only the NEW events since the last flush keeps the math correct.
+  const pendingCounts = {};
+  BLOCKED_EVENTS.forEach(e => { pendingCounts[e] = 0; });
+
+  /* ─────────────────────────────────────────────────────────────────
+   * 6. Report blocked event counts back to the relay script.
+   *
+   *    We cannot use chrome.runtime.sendMessage from MAIN world, so
+   *    we post a structured message on window.  The isolated-world
+   *    relay script (which CAN use chrome.*) listens and forwards it.
+   *    Throttled to once per 2 s to avoid spam.
+   * ───────────────────────────────────────────────────────────────── */
+  let reportTimer = null;
+
+  function scheduleReport() {
+    if (reportTimer) return;
+    reportTimer = setTimeout(() => {
+      reportTimer = null;
+
+      // Build a delta object containing only keys with new events.
+      // WHY skip zero-count keys?  Sending zeros wastes a message and
+      // could confuse the background if it receives an empty object.
+      const delta = {};
+      for (const key of BLOCKED_EVENTS) {
+        if (pendingCounts[key] > 0) {
+          delta[key] = pendingCounts[key];
+          pendingCounts[key] = 0; // Reset so the next flush starts fresh.
+        }
+      }
+
+      if (Object.keys(delta).length > 0) {
+        window.postMessage({ __saType: 'BLOCKED_COUNTS', counts: delta }, '*');
+      }
+    }, 2000);
+  }
+
+  function blockHandler(event) {
+    const t = event.target;
+    // Only intercept top-level targets — not inputs, buttons, etc.
+    if (t === window || t === document || t === document.documentElement) {
+      pendingCounts[event.type] = (pendingCounts[event.type] || 0) + 1;
+
+      // WHY call scheduleReport here, inside the same handler?  blockHandler
+      // is registered first in capture phase and calls
+      // stopImmediatePropagation(), which prevents any listener registered
+      // AFTER it on the same target from running.  A second capture listener
+      // for scheduleReport would never fire.  Calling it directly here is the
+      // only reliable way to trigger the throttled report.
+      scheduleReport();
+
+      event.stopImmediatePropagation();
+      // Don't call preventDefault() — some events have side-effects we
+      // still want (e.g., pagehide for bfcache).
     }
+  }
 
-    function dispatchFakeActivity() {
-      try {
-        // Synthetic mousemove — will NOT re-trigger our block handler
-        // because event.target is document.body, not window/document/<html>.
-        const mv = new MouseEvent('mousemove', {
-          bubbles: true, cancelable: true,
-          clientX: randomBetween(1, 10), clientY: randomBetween(1, 10),
-        });
-        document.dispatchEvent(mv);
+  for (const evtName of BLOCKED_EVENTS) {
+    window.addEventListener(evtName, blockHandler, true /* capture */);
+  }
 
-        // Tiny scroll keeps some idle APIs from firing.
-        window.scrollBy(0, 0);
-      } catch (_) {}
+  /* ─────────────────────────────────────────────────────────────────
+   * 5. Neutralise property-assignment handlers.
+   *
+   *    Some sites do: window.onblur = function() { pauseVideo(); }
+   *    We intercept the setter and silently discard the assignment.
+   * ───────────────────────────────────────────────────────────────── */
+  const noop = () => {};
+
+  function neutraliseSetter(obj, prop) {
+    Object.defineProperty(obj, prop, {
+      get: () => null,
+      set: noop,
+      configurable: true,
+      enumerable: true,
+    });
+  }
+
+  neutraliseSetter(window,   'onblur');
+  neutraliseSetter(window,   'onpagehide');
+  neutraliseSetter(document, 'onvisibilitychange');
+  neutraliseSetter(document, 'onwebkitvisibilitychange');
+
+  /* ─────────────────────────────────────────────────────────────────
+   * startExtras(cfg) — called once when SA_CONFIG message arrives.
+   *
+   * Contains sections 7 (anti-idle) and 8 (silent audio).
+   * These depend on user-configured options and must NOT run until
+   * config is known.  They are safe to skip entirely if both are off.
+   * ───────────────────────────────────────────────────────────────── */
+  function startExtras(cfg) {
+    // Verification hook — remove after confirming fix works.
+    console.debug('[StayActive] extras started', cfg);
+
+    /* ───────────────────────────────────────────────────────────────
+     * 7. Anti-idle / fake activity  (cfg.antiIdle || cfg.fakeActivity)
+     *
+     *    Dispatches synthetic mousemove + scroll on a random 20–40 s
+     *    interval so the OS/browser idle timer does not tick up.
+     *    Requests a Screen Wake Lock and re-acquires it when released.
+     * ─────────────────────────────────────────────────────────────── */
+    if (cfg.antiIdle || cfg.fakeActivity) {
+      function randomBetween(min, max) {
+        return Math.floor(Math.random() * (max - min + 1)) + min;
+      }
+
+      function dispatchFakeActivity() {
+        try {
+          // Synthetic mousemove — will NOT re-trigger our block handler
+          // because event.target is document.body, not window/document/<html>.
+          const mv = new MouseEvent('mousemove', {
+            bubbles: true, cancelable: true,
+            clientX: randomBetween(1, 10), clientY: randomBetween(1, 10),
+          });
+          document.dispatchEvent(mv);
+
+          // Tiny scroll keeps some idle APIs from firing.
+          window.scrollBy(0, 0);
+        } catch (_) {}
+
+        scheduleNextFakeActivity();
+      }
+
+      function scheduleNextFakeActivity() {
+        const delay = randomBetween(20000, 40000);
+        setTimeout(dispatchFakeActivity, delay);
+      }
 
       scheduleNextFakeActivity();
-    }
 
-    function scheduleNextFakeActivity() {
-      const delay = randomBetween(20000, 40000);
-      setTimeout(dispatchFakeActivity, delay);
-    }
+      /* Screen Wake Lock — re-acquire when released */
+      if ('wakeLock' in navigator) {
+        let wakeLockRef = null;
 
-    scheduleNextFakeActivity();
-
-    /* Screen Wake Lock — re-acquire when released */
-    if ('wakeLock' in navigator) {
-      let wakeLockRef = null;
-
-      async function acquireWakeLock() {
-        try {
-          wakeLockRef = await navigator.wakeLock.request('screen');
-          wakeLockRef.addEventListener('release', acquireWakeLock);
-        } catch (_) {
-          // Silently fail — wake lock is optional enhancement.
+        async function acquireWakeLock() {
+          try {
+            wakeLockRef = await navigator.wakeLock.request('screen');
+            wakeLockRef.addEventListener('release', acquireWakeLock);
+          } catch (_) {
+            // Silently fail — wake lock is optional enhancement.
+          }
         }
+
+        // Wake Lock requires a user gesture on some browsers; try immediately
+        // and also on first interaction.
+        acquireWakeLock();
+        document.addEventListener('click', acquireWakeLock, { once: true });
       }
 
-      // Wake Lock requires a user gesture on some browsers; try immediately
-      // and also on first interaction.
-      acquireWakeLock();
-      document.addEventListener('click', acquireWakeLock, { once: true });
+      /* Spoof Idle Detection API if present */
+      if (typeof IdleDetector !== 'undefined') {
+        try {
+          const OrigIdleDetector = IdleDetector;
+          class SpoofedIdleDetector extends OrigIdleDetector {
+            get userState()   { return 'active'; }
+            get screenState() { return 'unlocked'; }
+          }
+          window.IdleDetector = SpoofedIdleDetector;
+        } catch (_) {}
+      }
     }
 
-    /* Spoof Idle Detection API if present */
-    if (typeof IdleDetector !== 'undefined') {
-      try {
-        const OrigIdleDetector = IdleDetector;
-        class SpoofedIdleDetector extends OrigIdleDetector {
-          get userState()   { return 'active'; }
-          get screenState() { return 'unlocked'; }
-        }
-        window.IdleDetector = SpoofedIdleDetector;
-      } catch (_) {}
+    /* ───────────────────────────────────────────────────────────────
+     * 8. Silent audio keep-alive  (cfg.keepAliveAudio)
+     *
+     *    An oscillator running at gain 0 is enough to signal "active
+     *    audio" to Chrome's background throttling heuristic without
+     *    producing audible sound.
+     *
+     *    WHY: Chrome aggressively throttles setTimeout/setInterval in
+     *    hidden tabs unless audio is playing.  Gain-0 audio tricks it.
+     * ─────────────────────────────────────────────────────────────── */
+    if (cfg.keepAliveAudio) {
+      let audioCtx = null;
+
+      function startSilentAudio() {
+        try {
+          audioCtx = new AudioContext();
+          const osc  = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          gain.gain.value = 0;           // Completely silent.
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start();
+
+          // If autoplay policy suspends the context, resume on first interaction.
+          if (audioCtx.state === 'suspended') {
+            document.addEventListener('click', () => audioCtx.resume(), { once: true });
+          }
+        } catch (_) {}
+      }
+
+      // Defer slightly so the page has a chance to load its own AudioContext first.
+      setTimeout(startSilentAudio, 500);
     }
-  }
-
-  /* ─────────────────────────────────────────────────────────────────
-   * 8. Silent audio keep-alive  (cfg.keepAliveAudio)
-   *
-   *    An oscillator running at gain 0 is enough to signal "active
-   *    audio" to Chrome's background throttling heuristic without
-   *    producing audible sound.
-   *
-   *    WHY: Chrome aggressively throttles setTimeout/setInterval in
-   *    hidden tabs unless audio is playing.  Gain-0 audio tricks it.
-   * ───────────────────────────────────────────────────────────────── */
-  if (cfg.keepAliveAudio) {
-    let audioCtx = null;
-
-    function startSilentAudio() {
-      try {
-        audioCtx = new AudioContext();
-        const osc  = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        gain.gain.value = 0;           // Completely silent.
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start();
-
-        // If autoplay policy suspends the context, resume on first interaction.
-        if (audioCtx.state === 'suspended') {
-          document.addEventListener('click', () => audioCtx.resume(), { once: true });
-        }
-      } catch (_) {}
-    }
-
-    // Defer slightly so the page has a chance to load its own AudioContext first.
-    setTimeout(startSilentAudio, 500);
-  }
+  } // end startExtras
 
 })();

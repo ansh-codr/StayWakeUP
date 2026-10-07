@@ -25,6 +25,23 @@ const STORAGE_ENABLED_HOSTS = 'enabledHosts';
 const STORAGE_HOST_SETTINGS  = 'hostSettings';
 const STORAGE_BLOCKED_COUNTS = 'blockedCounts'; // per-tab counts cache
 
+/* ── Counts serial queue ────────────────────────────────────────────
+ * WHY a queue?  allFrames:true means multiple frames in one tab can
+ * each post BLOCKED_COUNTS simultaneously.  Without serialisation, two
+ * concurrent read-modify-write cycles race: one overwrites the other's
+ * write and a frame's counts are silently dropped.
+ *
+ * NOTE: countsQueue is ONLY a lock for in-flight work.  If the service
+ * worker restarts between events, the variable resets to
+ * Promise.resolve() — that is fine because all persisted state lives in
+ * chrome.storage.local, not in this variable.
+ * ────────────────────────────────────────────────────────────────── */
+let countsQueue = Promise.resolve();
+function enqueueCounts(fn) {
+  countsQueue = countsQueue.then(fn, fn).catch(err => console.error('[SA] counts', err));
+  return countsQueue;
+}
+
 const ICON_ON  = { 16: 'icons/icon16_on.png',  32: 'icons/icon32_on.png',  48: 'icons/icon48_on.png',  128: 'icons/icon128_on.png'  };
 const ICON_OFF = { 16: 'icons/icon16_off.png', 32: 'icons/icon32_off.png', 48: 'icons/icon48_off.png', 128: 'icons/icon128_off.png' };
 
@@ -620,24 +637,29 @@ async function handleMessage(message, sender) {
       const tabId  = sender.tab.id;
       const counts = message.counts || {};
 
-      const countsData = await getStorage(STORAGE_BLOCKED_COUNTS);
-      const allCounts  = countsData[STORAGE_BLOCKED_COUNTS] || {};
+      await enqueueCounts(async () => {
+        const countsData = await getStorage(STORAGE_BLOCKED_COUNTS);
+        const allCounts  = countsData[STORAGE_BLOCKED_COUNTS] || {};
 
-      // Accumulate counts per-tab.
-      const prev = allCounts[tabId] || {};
-      for (const [key, val] of Object.entries(counts)) {
-        prev[key] = (prev[key] || 0) + val;
-      }
-      allCounts[tabId] = prev;
+        // Accumulate deltas per-tab.  Re-validate here too: messages are
+        // now sanitized by relay.js, but defence-in-depth costs nothing.
+        const prev = allCounts[tabId] || {};
+        for (const [key, val] of Object.entries(counts)) {
+          if (Number.isFinite(val) && val > 0) {
+            prev[key] = (prev[key] || 0) + val;
+          }
+        }
+        allCounts[tabId] = prev;
 
-      await setStorage({ [STORAGE_BLOCKED_COUNTS]: allCounts });
+        await setStorage({ [STORAGE_BLOCKED_COUNTS]: allCounts });
 
-      // Forward to popup if it is open.
-      chrome.runtime.sendMessage({
-        type:   'COUNTS_UPDATED',
-        tabId,
-        counts: prev,
-      }).catch(() => {});
+        // Forward to popup if it is open.
+        chrome.runtime.sendMessage({
+          type:   'COUNTS_UPDATED',
+          tabId,
+          counts: prev,
+        }).catch(() => {});
+      });
 
       return { ok: true };
     }
