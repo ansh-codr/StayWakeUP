@@ -69,7 +69,6 @@ const UI = {
   cntVisibility:     $('cnt-visibilitychange'),
   cntBlur:           $('cnt-blur'),
   cntMouseleave:     $('cnt-mouseleave'),
-  cntPagehide:       $('cnt-pagehide'),
 };
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -190,7 +189,6 @@ function renderCounts(counts) {
   UI.cntVisibility.textContent = (counts.visibilitychange || 0) + (counts.webkitvisibilitychange || 0);
   UI.cntBlur.textContent       = counts.blur       || 0;
   UI.cntMouseleave.textContent = counts.mouseleave || 0;
-  UI.cntPagehide.textContent   = counts.pagehide   || 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════

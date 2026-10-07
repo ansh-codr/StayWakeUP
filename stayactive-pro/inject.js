@@ -33,6 +33,11 @@
    * Either way, startExtras runs exactly once thanks to extrasStarted.
    * ───────────────────────────────────────────────────────────────── */
 
+  // Cache native methods at document_start before page scripts can tamper with them.
+  // This protects against MAIN-world prototype pollution.
+  const nativePortPostMessage = MessagePort.prototype.postMessage;
+  const nativeJSONParse = JSON.parse;
+
   // Guard: run startExtras at most once per page load even if two
   // SA_CONFIG messages somehow arrive (shouldn't happen, but be safe).
   let extrasStarted = false;
@@ -46,7 +51,7 @@
 
     let cfg;
     try {
-      cfg = JSON.parse(event.data.cfg);
+      cfg = nativeJSONParse(event.data.cfg);
     } catch (_) {
       return;
     }
@@ -147,7 +152,6 @@
     'webkitvisibilitychange',
     'blur',
     'mouseleave',
-    'pagehide',
     'freeze',
   ];
 
@@ -186,7 +190,7 @@
       }
 
       if (Object.keys(delta).length > 0) {
-        channel.port1.postMessage({ __saType: 'BLOCKED_COUNTS', counts: delta });
+        nativePortPostMessage.call(channel.port1, { __saType: 'BLOCKED_COUNTS', counts: delta });
       }
     }, 2000);
   }
@@ -207,7 +211,7 @@
 
       event.stopImmediatePropagation();
       // Don't call preventDefault() — some events have side-effects we
-      // still want (e.g., pagehide for bfcache).
+      // still want.
     }
   }
 
@@ -233,7 +237,6 @@
   }
 
   neutraliseSetter(window,   'onblur');
-  neutraliseSetter(window,   'onpagehide');
   neutraliseSetter(document, 'onvisibilitychange');
   neutraliseSetter(document, 'onwebkitvisibilitychange');
 

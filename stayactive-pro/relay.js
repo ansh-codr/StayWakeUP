@@ -61,7 +61,7 @@
       // Hide the handshake from the webpage and prevent port theft.
       event.stopImmediatePropagation();
 
-      if (event.ports && event.ports.length > 0) {
+      if (!saPort && event.ports && event.ports.length > 0) {
         saPort = event.ports[0];
         
         saPort.onmessage = function(e) {
@@ -69,7 +69,7 @@
             // Sanitize before forwarding.
             const ALLOWED_KEYS = new Set([
               'visibilitychange', 'webkitvisibilitychange',
-              'blur', 'mouseleave', 'pagehide', 'freeze',
+              'blur', 'mouseleave', 'freeze',
             ]);
             const raw   = (typeof e.data.counts === 'object' && e.data.counts) ? e.data.counts : {};
             const clean = {};
