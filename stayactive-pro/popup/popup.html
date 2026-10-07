@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StayActive Pro</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <img id="header-icon" src="../icons/icon32_off.png" alt="" class="header-icon" />
+      <div>
+        <h1 class="app-name">StayActive Pro</h1>
+        <p id="hostname-display" class="hostname">Loading…</p>
+      </div>
+    </div>
+    <div id="status-dot" class="status-dot"></div>
+  </header>
+
+  <!-- Unsupported page notice -->
+  <div id="unsupported-notice" class="notice notice--warn hidden">
+    <span class="notice-icon">⚠️</span>
+    <span id="unsupported-text"></span>
+  </div>
+
+  <!-- Error banner -->
+  <div id="error-banner" class="notice notice--error hidden">
+    <span class="notice-icon">❌</span>
+    <span id="error-text"></span>
+  </div>
+
+  <!-- Main content -->
+  <main id="main-content" class="main-content hidden">
+
+    <!-- Master toggle -->
+    <section class="toggle-section">
+      <div class="toggle-row">
+        <div class="toggle-label-group">
+          <span class="toggle-label-primary" id="lbl-master-toggle">Always active on this site</span>
+          <span class="toggle-label-sub" id="lbl-master-sub">Spoofs visibility &amp; focus APIs</span>
+        </div>
+        <label class="switch" aria-label="Toggle always-active for this site">
+          <input type="checkbox" id="master-toggle" />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <!-- Include subdomains -->
+      <label class="subdomain-row" id="subdomain-row">
+        <input type="checkbox" id="include-subdomains" />
+        <span id="lbl-include-subdomains">Include subdomains</span>
+      </label>
+    </section>
+
+    <div class="divider"></div>
+
+    <!-- Extra tools collapsible -->
+    <section class="extra-tools" id="extra-tools-section">
+      <button class="collapsible-header" id="extra-tools-toggle" aria-expanded="false">
+        <span id="lbl-extra-tools">⚙️ Extra tools</span>
+        <span class="chevron" id="extra-chevron">›</span>
+      </button>
+
+      <div class="collapsible-body hidden" id="extra-tools-body">
+
+        <!-- A: Anti-idle -->
+        <div class="tool-row">
+          <div class="tool-info">
+            <span class="tool-name" id="lbl-anti-idle">Anti-idle &amp; Wake Lock</span>
+            <span class="tool-desc" id="lbl-anti-idle-desc">Fake mouse activity every 20–40 s</span>
+          </div>
+          <label class="switch switch--sm" aria-label="Toggle anti-idle">
+            <input type="checkbox" id="toggle-anti-idle" />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <!-- B: Silent audio -->
+        <div class="tool-row">
+          <div class="tool-info">
+            <span class="tool-name" id="lbl-keep-audio">Silent audio keep-alive</span>
+            <span class="tool-desc" id="lbl-keep-audio-desc">Prevents timer throttling</span>
+          </div>
+          <label class="switch switch--sm" aria-label="Toggle silent audio">
+            <input type="checkbox" id="toggle-keep-audio" />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <!-- C: Auto-refresh -->
+        <div class="tool-row tool-row--wrap">
+          <div class="tool-info">
+            <span class="tool-name" id="lbl-auto-refresh">Auto-refresh</span>
+            <span class="tool-desc" id="lbl-auto-refresh-desc">Reload tab every N seconds</span>
+          </div>
+          <label class="switch switch--sm" aria-label="Toggle auto-refresh">
+            <input type="checkbox" id="toggle-auto-refresh" />
+            <span class="slider"></span>
+          </label>
+          <div class="refresh-config" id="refresh-config">
+            <input
+              type="number"
+              id="refresh-seconds"
+              class="number-input"
+              min="5"
+              max="86400"
+              value="60"
+              aria-label="Refresh interval in seconds"
+            />
+            <span class="unit" id="lbl-seconds">s</span>
+            <span class="countdown" id="refresh-countdown"></span>
+          </div>
+        </div>
+
+        <!-- D: Blocked events counter -->
+        <div class="tool-row tool-row--counts">
+          <div class="tool-info">
+            <span class="tool-name" id="lbl-event-log">Blocked events</span>
+            <span class="tool-desc" id="lbl-event-log-desc">Events intercepted this session</span>
+          </div>
+          <div class="counts-grid" id="counts-grid">
+            <span class="count-label">vis</span><span class="count-value" id="cnt-visibilitychange">0</span>
+            <span class="count-label">blur</span><span class="count-value" id="cnt-blur">0</span>
+            <span class="count-label">leave</span><span class="count-value" id="cnt-mouseleave">0</span>
+            <span class="count-label">hide</span><span class="count-value" id="cnt-pagehide">0</span>
+          </div>
+        </div>
+
+      </div><!-- /collapsible-body -->
+    </section>
+
+  </main><!-- /main-content -->
+
+  <!-- Footer -->
+  <footer class="footer">
+    <a href="#" id="manage-sites-link" class="footer-link" id="lbl-manage-sites">Manage sites</a>
+    <span class="footer-sep">·</span>
+    <span class="footer-shortcut" id="shortcut-hint">Alt+Shift+A to toggle</span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
