@@ -37,38 +37,30 @@
   // SA_CONFIG messages somehow arrive (shouldn't happen, but be safe).
   let extrasStarted = false;
 
-  window.addEventListener('message', function onSaConfig(event) {
-    // Validate: must come from same window, be a plain object, have our tag.
-    if (
-      event.source !== window ||
-      !event.data ||
-      typeof event.data !== 'object' ||
-      event.data.__saType !== 'SA_CONFIG'
-    ) {
-      return;
-    }
+  // Create a secure MessageChannel. We send port2 to relay.js and listen on port1.
+  // This prevents the page from intercepting or spoofing SA_CONFIG / BLOCKED_COUNTS.
+  const channel = new MessageChannel();
 
-    // Parse the JSON string safely (relay sends cfg as a string so it
-    // crosses the MAIN/ISOLATED world boundary without object identity issues).
+  channel.port1.onmessage = function onSaConfig(event) {
+    if (!event.data || event.data.__saType !== 'SA_CONFIG') return;
+
     let cfg;
     try {
       cfg = JSON.parse(event.data.cfg);
     } catch (_) {
-      // Malformed JSON — skip; core spoofing is already running.
       return;
     }
 
-    // Single-run guard (WHY: storage reads or relay restarts could fire
-    // a second SA_CONFIG; we must not double-start timers/AudioContexts).
     if (extrasStarted) return;
     extrasStarted = true;
 
     startExtras(cfg);
-  });
+  };
 
-  // Tell relay.js we are ready.  If relay.js loaded first and already has
-  // config cached, it will re-post SA_CONFIG in response to this message.
-  window.postMessage({ __saType: 'SA_READY' }, '*');
+  // Tell relay.js we are ready and pass the secure port.
+  // relay.js uses a capture-phase listener to intercept this and stop propagation,
+  // so the page never sees the message or steals the port.
+  window.postMessage({ __saType: 'SA_READY' }, '*', [channel.port2]);
 
   /* ─────────────────────────────────────────────────────────────────
    * 2. Native-code toString spoofing helper.
@@ -194,7 +186,7 @@
       }
 
       if (Object.keys(delta).length > 0) {
-        window.postMessage({ __saType: 'BLOCKED_COUNTS', counts: delta }, '*');
+        channel.port1.postMessage({ __saType: 'BLOCKED_COUNTS', counts: delta });
       }
     }, 2000);
   }

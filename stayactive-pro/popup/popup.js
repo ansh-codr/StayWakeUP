@@ -238,38 +238,54 @@ async function loadState() {
 UI.masterToggle.addEventListener('change', async () => {
   hideError();
   const enabled = UI.masterToggle.checked;
+  UI.masterToggle.disabled = true;
 
-  if (enabled) {
-    // IMPORTANT: chrome.permissions.request must be inside a user-gesture
-    // handler.  This click handler qualifies.  We send a message to
-    // background.js which will call chrome.permissions.request in its
-    // onMessage handler — which also counts as a user-gesture context.
-    try {
+  try {
+    if (enabled) {
+      const includeSubdomains = UI.includeSubdomains.checked;
+      const patterns = [`*://${state.hostname}/*`];
+      if (includeSubdomains) {
+        patterns.push(`*://*.${state.hostname}/*`);
+      }
+
+      const hasPermission = await chrome.permissions.contains({ origins: patterns });
+      if (!hasPermission) {
+        // Host permission requests must originate from a user gesture,
+        // so the request is intentionally performed in the popup click flow.
+        let granted = false;
+        try {
+          granted = await chrome.permissions.request({ origins: patterns });
+        } catch (error) {
+          console.error("[StayActive] permission request failed", error);
+        }
+        
+        if (!granted) {
+          UI.masterToggle.checked = false; // Revert.
+          showError("Permission was not granted. This site was not enabled.");
+          return;
+        }
+      }
+
       const resp = await chrome.runtime.sendMessage({
         type:     'ENABLE_SITE',
         hostname: state.hostname,
         tabId:    state.tabId,
         options:  {
-          includeSubdomains: UI.includeSubdomains.checked,
+          includeSubdomains: includeSubdomains,
           spoofVisibility:   true,
         },
       });
 
       if (!resp || !resp.ok) {
         UI.masterToggle.checked = false; // Revert.
-        showError(resp?.error || 'Failed to enable.');
+        showError(resp?.error === 'HOST_PERMISSION_MISSING' ? "This site's permission is missing. Please try enabling it again." : "Could not enable this site.");
         return;
       }
 
       state.enabled = true;
       state.settings = resp.settings || state.settings;
       render();
-    } catch (err) {
-      UI.masterToggle.checked = false;
-      showError(err.message || String(err));
-    }
-  } else {
-    try {
+    } else {
       const resp = await chrome.runtime.sendMessage({
         type:     'DISABLE_SITE',
         hostname: state.hostname,
@@ -278,16 +294,18 @@ UI.masterToggle.addEventListener('change', async () => {
 
       if (!resp || !resp.ok) {
         UI.masterToggle.checked = true; // Revert.
-        showError(resp?.error || 'Failed to disable.');
+        showError("Could not disable this site.");
         return;
       }
 
       state.enabled = false;
       render();
-    } catch (err) {
-      UI.masterToggle.checked = true;
-      showError(err.message || String(err));
     }
+  } catch (err) {
+    UI.masterToggle.checked = !enabled;
+    showError(err.message || String(err));
+  } finally {
+    UI.masterToggle.disabled = false;
   }
 });
 

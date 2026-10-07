@@ -32,78 +32,68 @@
   // Cache for config read from storage.  null = not yet loaded.
   let cachedCfg = null;
 
+  let saPort = null;
+
   /* ─────────────────────────────────────────────────────────────────
-   * postConfig — post SA_CONFIG to window (and therefore to inject.js).
+   * postConfig — post SA_CONFIG to inject.js.
    * Sends cfg as a JSON STRING so it crosses the world boundary safely.
    * ───────────────────────────────────────────────────────────────── */
   function postConfig(cfg) {
-    window.postMessage({
-      __saType: 'SA_CONFIG',
-      cfg: JSON.stringify(cfg),
-    }, '*');
+    if (saPort) {
+      saPort.postMessage({
+        __saType: 'SA_CONFIG',
+        cfg: JSON.stringify(cfg),
+      });
+    }
   }
 
   /* ─────────────────────────────────────────────────────────────────
-   * Synchronous message listener — registered BEFORE any await so
-   * messages posted by inject.js are never missed.
-   *
-   * Handles two message types:
-   *   SA_READY      — inject.js is listening; reply with SA_CONFIG if
-   *                   we already have config.
-   *   BLOCKED_COUNTS — forward event-count data to the service worker.
-   *
-   * WHY register BLOCKED_COUNTS here (not after the storage await)?
-   *   The old code registered it inside the async IIFE body, after the
-   *   await.  That meant it could miss messages posted by inject.js
-   *   before the await resolved.  Registering synchronously fixes that.
+   * Synchronous capture-phase message listener.
+   * Registered at document_start, before page scripts, so it intercepts
+   * SA_READY before the page can see it or steal the MessageChannel port.
    * ───────────────────────────────────────────────────────────────── */
   window.addEventListener('message', function onWindowMessage(event) {
-    // Validate: must be from the same window and carry our sentinel key.
-    if (
-      event.source !== window ||
-      !event.data ||
-      typeof event.data !== 'object'
-    ) {
+    if (event.source !== window || !event.data || typeof event.data !== 'object') {
       return;
     }
 
     if (event.data.__saType === 'SA_READY') {
-      // inject.js just announced it is ready.  If we already have config
-      // (storage resolved before inject.js posted SA_READY), send it now.
-      if (cachedCfg !== null) {
-        postConfig(cachedCfg);
-      }
-      // If cachedCfg is still null, the storage callback will post SA_CONFIG
-      // once it finishes — inject.js is already listening by then.
-      return;
-    }
+      // Hide the handshake from the webpage and prevent port theft.
+      event.stopImmediatePropagation();
 
-    if (event.data.__saType === 'BLOCKED_COUNTS') {
-      // Sanitize before forwarding — a page script could post a fake
-      // BLOCKED_COUNTS message (Bug D).  Only pass known keys with
-      // finite positive values, clamped to 1000 to bound storage growth.
-      const ALLOWED_KEYS = new Set([
-        'visibilitychange', 'webkitvisibilitychange',
-        'blur', 'mouseleave', 'pagehide', 'freeze',
-      ]);
-      const raw   = (typeof event.data.counts === 'object' && event.data.counts) ? event.data.counts : {};
-      const clean = {};
-      for (const key of ALLOWED_KEYS) {
-        const v = raw[key];
-        if (Number.isFinite(v) && v > 0) {
-          clean[key] = Math.min(v, 1000);
+      if (event.ports && event.ports.length > 0) {
+        saPort = event.ports[0];
+        
+        saPort.onmessage = function(e) {
+          if (e.data && e.data.__saType === 'BLOCKED_COUNTS') {
+            // Sanitize before forwarding.
+            const ALLOWED_KEYS = new Set([
+              'visibilitychange', 'webkitvisibilitychange',
+              'blur', 'mouseleave', 'pagehide', 'freeze',
+            ]);
+            const raw   = (typeof e.data.counts === 'object' && e.data.counts) ? e.data.counts : {};
+            const clean = {};
+            for (const key of ALLOWED_KEYS) {
+              const v = raw[key];
+              if (Number.isFinite(v) && v > 0) {
+                clean[key] = Math.min(v, 1000);
+              }
+            }
+            if (Object.keys(clean).length === 0) return;
+
+            chrome.runtime.sendMessage({
+              type:   'BLOCKED_COUNTS',
+              counts: clean,
+            }).catch(() => {});
+          }
+        };
+
+        if (cachedCfg !== null) {
+          postConfig(cachedCfg);
         }
       }
-      // Only forward if there is something meaningful to report.
-      if (Object.keys(clean).length === 0) return;
-
-      chrome.runtime.sendMessage({
-        type:   'BLOCKED_COUNTS',
-        counts: clean,
-      }).catch(() => {});
-      return;
     }
-  });
+  }, true); // Use capture phase to intercept the event!
 
   /* ─────────────────────────────────────────────────────────────────
    * Async storage read — runs concurrently with the listener above.

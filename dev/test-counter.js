@@ -66,7 +66,8 @@ function wait(ms) {
 }
 
 function deepEqual(a, b) {
-  return JSON.stringify(a) === JSON.stringify(b);
+  const sortedStr = obj => JSON.stringify(obj, Object.keys(obj).sort());
+  return sortedStr(a) === sortedStr(b);
 }
 
 function assert(condition, msg) {

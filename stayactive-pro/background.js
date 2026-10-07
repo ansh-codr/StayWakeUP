@@ -273,11 +273,13 @@ async function removeHostPermission(hostname) {
  */
 async function enableSite(hostname, tabId, options = {}) {
   try {
-    // 1. Request permission — MUST be inside user-gesture message handler.
+    // 1. Verify permission — the popup (or keyboard command) should have already requested it.
     const includeSubdomains = !!options.includeSubdomains;
-    const granted = await requestHostPermission(hostname, includeSubdomains);
-    if (!granted) {
-      return { ok: false, error: 'Permission denied by user.' };
+    const origins = matchPatterns(hostname, includeSubdomains);
+    
+    const hasPermission = await chrome.permissions.contains({ origins });
+    if (!hasPermission) {
+      return { ok: false, error: 'HOST_PERMISSION_MISSING' };
     }
 
     // 2. Save to storage.
@@ -519,7 +521,14 @@ chrome.commands.onCommand.addListener(async (command) => {
       await disableSite(hostname, tab.id);
     } else {
       // Keyboard commands are user gestures — permission request is allowed.
-      await enableSite(hostname, tab.id);
+      // Default to false for includeSubdomains in quick toggle.
+      const origins = matchPatterns(hostname, false);
+      const hasPermission = await chrome.permissions.contains({ origins });
+      if (!hasPermission) {
+        const granted = await requestHostPermission(hostname, false);
+        if (!granted) return;
+      }
+      await enableSite(hostname, tab.id, { includeSubdomains: false });
     }
   } catch (err) {
     console.error('[SA] toggle-site command error', err);
@@ -538,6 +547,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function handleMessage(message, sender) {
+  // BLOCKED_COUNTS comes from content scripts (relay.js), which have a sender.tab.
+  if (message.type === 'BLOCKED_COUNTS') {
+    if (!sender.tab) return { ok: false };
+  } else {
+    // All other messages must come from an extension page (popup/options).
+    const extUrl = chrome.runtime.getURL('');
+    if (!sender.url || !sender.url.startsWith(extUrl)) {
+      return { ok: false, error: 'Unauthorized sender' };
+    }
+  }
+
   switch (message.type) {
 
     /* ── Popup: get current tab state ── */
@@ -580,13 +600,21 @@ async function handleMessage(message, sender) {
 
     /* ── Popup: enable site (MUST be from user gesture) ── */
     case 'ENABLE_SITE': {
-      const { hostname, tabId, options } = message;
+      const { tabId, options } = message;
+      // Derive hostname securely from the trusted tab object, not the message payload.
+      const tab = await chrome.tabs.get(tabId);
+      const url = new URL(tab.url);
+      const hostname = url.hostname;
       return await enableSite(hostname, tabId, options);
     }
 
     /* ── Popup: disable site ── */
     case 'DISABLE_SITE': {
-      const { hostname, tabId } = message;
+      const { tabId } = message;
+      // Derive hostname securely from the trusted tab object.
+      const tab = await chrome.tabs.get(tabId);
+      const url = new URL(tab.url);
+      const hostname = url.hostname;
       return await disableSite(hostname, tabId);
     }
 
