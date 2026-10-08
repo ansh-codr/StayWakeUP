@@ -38,17 +38,21 @@
   const nativePortPostMessage = MessagePort.prototype.postMessage;
   const nativeJSONParse = JSON.parse;
 
-  // Guard: run startExtras at most once per page load even if two
-  // SA_CONFIG messages somehow arrive (shouldn't happen, but be safe).
-  let extrasStarted = false;
-
-  // Create a secure MessageChannel. We send port2 to relay.js and listen on port1.
-  // This prevents the page from intercepting or spoofing SA_CONFIG / BLOCKED_COUNTS.
-  const channel = new MessageChannel();
+  // Extras state moved to IIFE scope
+  let fakeActivityTimer = null;
+  let wakeLockRef = null;
+  let audioCtx = null;
+  let osc = null;
+  let OrigIdleDetector = typeof IdleDetector !== 'undefined' ? IdleDetector : null;
+  let listenersInstalled = false;
 
   let currentCfg = null;
+  let configReceived = false;
+  let activePort = null;
+  let retryTimer = null;
+  const channels = [];
 
-  channel.port1.onmessage = function onSaConfig(event) {
+  function onSaConfig(event) {
     if (!event.data || event.data.__saType !== 'SA_CONFIG') return;
 
     let cfg;
@@ -58,18 +62,52 @@
       return;
     }
 
+    if (!configReceived) {
+      configReceived = true;
+      activePort = event.target;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      // WHY: Close unused ports to prevent memory leaks.
+      for (const ch of channels) {
+        if (ch.port1 !== activePort) {
+          ch.port1.close();
+        }
+      }
+    }
+
     currentCfg = cfg;
+    applyExtras();
+  }
 
-    if (extrasStarted) return;
-    extrasStarted = true;
+  // WHY: relay.js might load later than inject.js. A fresh channel per retry is needed
+  // because a MessagePort can only be transferred once via postMessage.
+  function sendReady() {
+    if (configReceived) return;
+    const ch = new MessageChannel();
+    channels.push(ch);
+    ch.port1.onmessage = onSaConfig;
+    window.postMessage({ __saType: 'SA_READY' }, '*', [ch.port2]);
+  }
 
-    startExtras();
-  };
+  const retryDelays = [100, 300, 800, 2000, 5000];
+  let retryIndex = 0;
 
-  // Tell relay.js we are ready and pass the secure port.
-  // relay.js uses a capture-phase listener to intercept this and stop propagation,
-  // so the page never sees the message or steals the port.
-  window.postMessage({ __saType: 'SA_READY' }, '*', [channel.port2]);
+  function scheduleRetry() {
+    if (configReceived || retryIndex >= retryDelays.length) return;
+    retryTimer = setTimeout(() => {
+      if (!configReceived) {
+        sendReady();
+        retryIndex++;
+        scheduleRetry();
+      }
+    }, retryDelays[retryIndex]);
+  }
+
+  sendReady();
+  scheduleRetry();
+
 
   /* ─────────────────────────────────────────────────────────────────
    * 2. Native-code toString spoofing helper.
@@ -187,7 +225,14 @@
       }
 
       if (Object.keys(delta).length > 0) {
-        nativePortPostMessage.call(channel.port1, { __saType: 'BLOCKED_COUNTS', counts: delta });
+        if (activePort) {
+          nativePortPostMessage.call(activePort, { __saType: 'BLOCKED_COUNTS', counts: delta });
+        } else {
+          // Keep accumulating if no active port yet
+          for (const key in delta) {
+            pendingCounts[key] = (pendingCounts[key] || 0) + delta[key];
+          }
+        }
       }
     }, 2000);
   }
@@ -211,6 +256,12 @@
       // still want.
     }
   }
+
+  // WHY: The wake-lock re-acquire listener must be registered before blockHandler
+  // because blockHandler calls stopImmediatePropagation().
+  window.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') acquireWakeLock();
+  }, { capture: true, passive: true });
 
   for (const evtName of BLOCKED_EVENTS) {
     window.addEventListener(evtName, blockHandler, true /* capture */);
@@ -238,123 +289,123 @@
   neutraliseSetter(document, 'onwebkitvisibilitychange');
 
   /* ─────────────────────────────────────────────────────────────────
-   * startExtras(cfg) — called once when SA_CONFIG message arrives.
-   *
-   * Contains sections 7 (anti-idle) and 8 (silent audio).
-   * These depend on user-configured options and must NOT run until
-   * config is known.  They are safe to skip entirely if both are off.
+   * applyExtras() — idempotent config apply called on EVERY SA_CONFIG.
    * ───────────────────────────────────────────────────────────────── */
-  function startExtras() {
-    /* ───────────────────────────────────────────────────────────────
-     * 7. Anti-idle / fake activity
-     * ─────────────────────────────────────────────────────────────── */
-    let fakeActivityTimer = null;
+  function applyExtras() {
+    const wanted = currentCfg && (currentCfg.antiIdle || currentCfg.fakeActivity);
 
-    function randomBetween(min, max) {
-      return Math.floor(Math.random() * (max - min + 1)) + min;
-    }
-
-    function dispatchFakeActivity() {
-      if (!currentCfg || (!currentCfg.antiIdle && !currentCfg.fakeActivity)) {
+    /* 7. Anti-idle / fake activity */
+    if (wanted) {
+      if (!fakeActivityTimer) scheduleNextFakeActivity();
+    } else {
+      if (fakeActivityTimer) {
+        clearTimeout(fakeActivityTimer);
         fakeActivityTimer = null;
-        return;
       }
-
-      try {
-        const mv = new MouseEvent('mousemove', {
-          bubbles: true, cancelable: true,
-          clientX: randomBetween(1, 10), clientY: randomBetween(1, 10),
-        });
-        document.dispatchEvent(mv);
-        window.scrollBy(0, 0);
-      } catch (_) {}
-
-      scheduleNextFakeActivity();
     }
-
-    function scheduleNextFakeActivity() {
-      if (!currentCfg || (!currentCfg.antiIdle && !currentCfg.fakeActivity)) return;
-      const delay = randomBetween(20000, 40000);
-      fakeActivityTimer = setTimeout(dispatchFakeActivity, delay);
-    }
-
-    scheduleNextFakeActivity();
 
     /* Screen Wake Lock */
-    if ('wakeLock' in navigator) {
-      let wakeLockRef = null;
-
-      async function acquireWakeLock() {
-        if (!currentCfg || (!currentCfg.antiIdle && !currentCfg.fakeActivity)) {
-          if (wakeLockRef) {
-            wakeLockRef.release().catch(() => {});
-            wakeLockRef = null;
-          }
-          return;
-        }
-        if (wakeLockRef !== null && !wakeLockRef.released) return;
-        try {
-          wakeLockRef = await navigator.wakeLock.request('screen');
-          wakeLockRef.addEventListener('release', () => {
-            wakeLockRef = null;
-          }, { once: true });
-        } catch (_) {
-          wakeLockRef = null;
-        }
-      }
-
-      acquireWakeLock();
-      document.addEventListener('click', acquireWakeLock, { capture: true, passive: true });
-      document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') acquireWakeLock();
-      }, { capture: true, passive: true });
-    }
+    acquireWakeLock();
 
     /* Spoof Idle Detection API if present */
-    if (typeof IdleDetector !== 'undefined') {
-      try {
-        const OrigIdleDetector = IdleDetector;
-        class SpoofedIdleDetector extends OrigIdleDetector {
-          get userState()   { return 'active'; }
-          get screenState() { return 'unlocked'; }
-        }
-        window.IdleDetector = SpoofedIdleDetector;
-      } catch (_) {}
-    }
-
-    /* ───────────────────────────────────────────────────────────────
-     * 8. Silent audio keep-alive
-     * ─────────────────────────────────────────────────────────────── */
-    let audioCtx = null;
-    let osc = null;
-
-    function ensureAudioState() {
-      const wantAudio = currentCfg && currentCfg.keepAliveAudio;
-      if (wantAudio && !audioCtx) {
+    if (OrigIdleDetector) {
+      if (wanted) {
         try {
-          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-          const gain = audioCtx.createGain();
-          gain.gain.value = 0;
-          gain.connect(audioCtx.destination);
-
-          osc = audioCtx.createOscillator();
-          osc.type = 'sine';
-          osc.frequency.value = 1;
-          osc.connect(gain);
-          osc.start();
+          class SpoofedIdleDetector extends OrigIdleDetector {
+            get userState()   { return 'active'; }
+            get screenState() { return 'unlocked'; }
+          }
+          window.IdleDetector = SpoofedIdleDetector;
         } catch (_) {}
-      } else if (!wantAudio && audioCtx) {
-        try {
-          if (osc) osc.stop();
-          audioCtx.close().catch(() => {});
-        } catch (_) {}
-        audioCtx = null;
-        osc = null;
+      } else {
+        window.IdleDetector = OrigIdleDetector;
       }
     }
 
-    setTimeout(ensureAudioState, 500);
-    document.addEventListener('click', ensureAudioState, { capture: true, passive: true });
+    /* 8. Silent audio keep-alive */
+    ensureAudioState();
+
+    if (!listenersInstalled) {
+      document.addEventListener('click', () => {
+        acquireWakeLock();
+        ensureAudioState();
+      }, { capture: true, passive: true });
+      listenersInstalled = true;
+    }
+  }
+
+  function randomBetween(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  function dispatchFakeActivity() {
+    const wanted = currentCfg && (currentCfg.antiIdle || currentCfg.fakeActivity);
+    if (!wanted) {
+      fakeActivityTimer = null;
+      return;
+    }
+
+    try {
+      const mv = new MouseEvent('mousemove', {
+        bubbles: true, cancelable: true,
+        clientX: randomBetween(1, 10), clientY: randomBetween(1, 10),
+      });
+      document.dispatchEvent(mv);
+      window.scrollBy(0, 0);
+    } catch (_) {}
+
+    scheduleNextFakeActivity();
+  }
+
+  function scheduleNextFakeActivity() {
+    const delay = randomBetween(20000, 40000);
+    fakeActivityTimer = setTimeout(dispatchFakeActivity, delay);
+  }
+
+  async function acquireWakeLock() {
+    const wanted = currentCfg && (currentCfg.antiIdle || currentCfg.fakeActivity);
+    if (!wanted) {
+      if (wakeLockRef) {
+        wakeLockRef.release().catch(() => {});
+        wakeLockRef = null;
+      }
+      return;
+    }
+    if (!('wakeLock' in navigator)) return;
+    if (wakeLockRef !== null && !wakeLockRef.released) return;
+    try {
+      wakeLockRef = await navigator.wakeLock.request('screen');
+      wakeLockRef.addEventListener('release', () => {
+        wakeLockRef = null;
+      }, { once: true });
+    } catch (_) {
+      wakeLockRef = null;
+    }
+  }
+
+  function ensureAudioState() {
+    const wantAudio = currentCfg && currentCfg.keepAliveAudio;
+    if (wantAudio && !audioCtx) {
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const gain = audioCtx.createGain();
+        gain.gain.value = 0;
+        gain.connect(audioCtx.destination);
+
+        osc = audioCtx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.value = 1;
+        osc.connect(gain);
+        osc.start();
+      } catch (_) {}
+    } else if (!wantAudio && audioCtx) {
+      try {
+        if (osc) osc.stop();
+        audioCtx.close().catch(() => {});
+      } catch (_) {}
+      audioCtx = null;
+      osc = null;
+    }
   }
 
 })();

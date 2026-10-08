@@ -95,6 +95,40 @@
     }
   }, true); // Use capture phase to intercept the event!
 
+  // WHY: We need to walk up parent domains to find an entry with includeSubdomains === true
+  // if an exact match isn't found. We also guard against prototype pollution.
+  function cfgForHost(hostSettings, hostname) {
+    let s = null;
+    if (hostSettings && typeof hostSettings === 'object') {
+      if (Object.prototype.hasOwnProperty.call(hostSettings, hostname)) {
+        const exact = hostSettings[hostname];
+        if (exact && typeof exact === 'object') {
+          s = exact;
+        }
+      }
+      if (!s) {
+        const parts = hostname.split('.');
+        // Check a.b.example.com -> b.example.com -> example.com
+        for (let i = 1; i < parts.length - 1; i++) {
+          const parent = parts.slice(i).join('.');
+          if (Object.prototype.hasOwnProperty.call(hostSettings, parent)) {
+            const entry = hostSettings[parent];
+            if (entry && typeof entry === 'object' && entry.includeSubdomains === true) {
+              s = entry;
+              break;
+            }
+          }
+        }
+      }
+    }
+    s = s || {};
+    return {
+      antiIdle:       !!s.antiIdle,
+      keepAliveAudio: !!s.keepAliveAudio,
+      fakeActivity:   !!s.fakeActivity,
+    };
+  }
+
   /* ─────────────────────────────────────────────────────────────────
    * Async storage read — runs concurrently with the listener above.
    * When done, caches the config and posts SA_CONFIG to inject.js.
@@ -106,14 +140,7 @@
     try {
       const hostname     = location.hostname;
       const result       = await chrome.storage.local.get(['hostSettings']);
-      const hostSettings = result.hostSettings || {};
-      const s            = hostSettings[hostname] || {};
-
-      cfg = {
-        antiIdle:       !!s.antiIdle,
-        keepAliveAudio: !!s.keepAliveAudio,
-        fakeActivity:   !!s.fakeActivity,
-      };
+      cfg = cfgForHost(result.hostSettings, hostname);
     } catch (err) {
       // If storage throws, still post SA_CONFIG with all-false so inject.js
       // doesn't hang waiting for a message that will never arrive.
@@ -135,13 +162,7 @@
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && changes.hostSettings) {
       const hostname = location.hostname;
-      const hostSettings = changes.hostSettings.newValue || {};
-      const s = hostSettings[hostname] || {};
-      const cfg = {
-        antiIdle:       !!s.antiIdle,
-        keepAliveAudio: !!s.keepAliveAudio,
-        fakeActivity:   !!s.fakeActivity,
-      };
+      const cfg = cfgForHost(changes.hostSettings.newValue, hostname);
       cachedCfg = cfg;
       postConfig(cfg);
     }
