@@ -64,6 +64,28 @@ function isUnsupported(url) {
   return UNSUPPORTED_ORIGINS.some(prefix => url.startsWith(prefix));
 }
 
+function isValidHostname(str) {
+  if (!str || typeof str !== 'string') return false;
+  str = str.trim();
+  if (str.length === 0 || str.length > 255) return false;
+  if (/[\s/#?@:]/.test(str)) return false;
+  if (str === '*' || str.startsWith('*.')) return false;
+  try {
+    const url = new URL(`http://${str}`);
+    return url.hostname === str.toLowerCase();
+  } catch (_) {
+    return false;
+  }
+}
+
+function normalizeHostname(str) {
+  try {
+    return new URL(`http://${str.trim()}`).hostname;
+  } catch (_) {
+    return null;
+  }
+}
+
 function scriptId(hostname) {
   // Dynamic content-script IDs must be unique strings.
   return `sa-${hostname}`;
@@ -96,7 +118,15 @@ async function setStorage(obj) {
 
 async function getEnabledHosts() {
   const data = await getStorage(STORAGE_ENABLED_HOSTS);
-  return data[STORAGE_ENABLED_HOSTS] || [];
+  const raw = data[STORAGE_ENABLED_HOSTS];
+  if (!Array.isArray(raw)) return [];
+  // Silently drop invalid hosts and normalize valid ones
+  const valid = [];
+  for (const h of raw) {
+    if (isValidHostname(h)) valid.push(normalizeHostname(h));
+  }
+  // Deduplicate
+  return [...new Set(valid)];
 }
 
 async function getHostSettings() {
@@ -340,7 +370,7 @@ async function disableSite(hostname, tabId) {
     ]);
 
     const newHosts = hosts.filter(h => h !== hostname);
-    delete hostSettings[hostname];
+    // Preserved: we do NOT delete hostSettings[hostname] so tool preferences remain saved when toggled OFF.
 
     await setStorage({
       [STORAGE_ENABLED_HOSTS]: newHosts,
@@ -359,6 +389,25 @@ async function disableSite(hostname, tabId) {
     return { ok: true };
   } catch (err) {
     console.error('[SA] disableSite error', err);
+    return { ok: false, error: err.message || String(err) };
+  }
+}
+
+/**
+ * Remove StayActive for a hostname (disable and clear settings).
+ */
+async function removeSite(hostname, tabId) {
+  try {
+    await disableSite(hostname, tabId);
+    
+    // Explicitly delete settings for full removal.
+    const hostSettings = await getHostSettings();
+    delete hostSettings[hostname];
+    await setStorage({ [STORAGE_HOST_SETTINGS]: hostSettings });
+    
+    return { ok: true };
+  } catch (err) {
+    console.error('[SA] removeSite error', err);
     return { ok: false, error: err.message || String(err) };
   }
 }
@@ -430,6 +479,8 @@ async function syncScriptsOnStartup() {
       getHostSettings(),
     ]);
 
+    const activeAlarms = new Set();
+
     for (const hostname of hosts) {
       const settings        = hostSettings[hostname] || defaultHostSettings();
       const includeSubdoms  = !!settings.includeSubdomains;
@@ -438,6 +489,15 @@ async function syncScriptsOnStartup() {
       // Restore auto-refresh alarms.
       if (settings.autoRefresh) {
         startAutoRefreshAlarm(hostname, settings.autoRefreshSeconds || 60);
+        activeAlarms.add(alarmName(hostname));
+      }
+    }
+
+    // Cleanup stale alarms
+    const allAlarms = await chrome.alarms.getAll();
+    for (const alarm of allAlarms) {
+      if (alarm.name.startsWith('autoRefresh:') && !activeAlarms.has(alarm.name)) {
+        await chrome.alarms.clear(alarm.name);
       }
     }
   } catch (err) {
@@ -605,23 +665,42 @@ async function handleMessage(message, sender) {
       const tab = await chrome.tabs.get(tabId);
       const url = new URL(tab.url);
       const hostname = url.hostname;
-      return await enableSite(hostname, tabId, options);
+      if (!isValidHostname(hostname)) return { ok: false, error: 'Invalid hostname derived from tab' };
+      return await enableSite(normalizeHostname(hostname), tabId, options);
     }
 
     /* ── Popup: disable site ── */
     case 'DISABLE_SITE': {
       const { tabId } = message;
-      // Derive hostname securely from the trusted tab object.
-      const tab = await chrome.tabs.get(tabId);
-      const url = new URL(tab.url);
-      const hostname = url.hostname;
-      return await disableSite(hostname, tabId);
+      let hostname = message.hostname;
+      if (tabId != null) {
+        // Derive hostname securely from the trusted tab object if available.
+        const tab = await chrome.tabs.get(tabId);
+        const url = new URL(tab.url);
+        hostname = url.hostname;
+      }
+      if (!isValidHostname(hostname)) return { ok: false, error: 'Invalid hostname provided' };
+      return await disableSite(normalizeHostname(hostname), tabId);
+    }
+
+    /* ── Options: remove site completely ── */
+    case 'REMOVE_SITE': {
+      const { tabId } = message;
+      let hostname = message.hostname;
+      if (tabId != null) {
+        const tab = await chrome.tabs.get(tabId);
+        const url = new URL(tab.url);
+        hostname = url.hostname;
+      }
+      if (!isValidHostname(hostname)) return { ok: false, error: 'Invalid hostname provided' };
+      return await removeSite(normalizeHostname(hostname), tabId);
     }
 
     /* ── Popup/options: update a single host setting ── */
     case 'UPDATE_HOST_SETTING': {
       const { hostname, patch } = message;
-      return await updateHostSetting(hostname, patch);
+      if (!isValidHostname(hostname)) return { ok: false, error: 'Invalid hostname provided' };
+      return await updateHostSetting(normalizeHostname(hostname), patch);
     }
 
     /* ── Options: get all enabled hosts with settings ── */
@@ -650,13 +729,57 @@ async function handleMessage(message, sender) {
 
     /* ── Options: import settings ── */
     case 'IMPORT_SETTINGS': {
-      const { enabledHosts, hostSettings } = message.data;
-      await setStorage({
-        [STORAGE_ENABLED_HOSTS]: enabledHosts || [],
-        [STORAGE_HOST_SETTINGS]: hostSettings || {},
-      });
-      await syncScriptsOnStartup();
-      return { ok: true };
+      try {
+        const { enabledHosts, hostSettings } = message.data;
+        if (!Array.isArray(enabledHosts)) throw new Error('enabledHosts must be an array');
+        if (!hostSettings || typeof hostSettings !== 'object') throw new Error('hostSettings must be an object');
+
+        const validHosts = [];
+        const validSettings = {};
+
+        // Validate hosts
+        for (const h of enabledHosts) {
+          if (!isValidHostname(h)) throw new Error(`Invalid hostname in enabledHosts: ${h}`);
+          validHosts.push(normalizeHostname(h));
+        }
+
+        // Validate settings
+        for (const [key, val] of Object.entries(hostSettings)) {
+          if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+          if (!isValidHostname(key)) throw new Error(`Invalid hostname in hostSettings key: ${key}`);
+          const normKey = normalizeHostname(key);
+          if (!val || typeof val !== 'object') throw new Error(`Settings for ${key} must be an object`);
+
+          // Start with defaults to ensure complete schema
+          const cleanVal = defaultHostSettings();
+          const boolProps = ['spoofVisibility', 'includeSubdomains', 'antiIdle', 'keepAliveAudio', 'autoRefresh', 'fakeActivity'];
+          
+          for (const prop of boolProps) {
+            if (val[prop] !== undefined) {
+              if (typeof val[prop] !== 'boolean') throw new Error(`${prop} must be a boolean`);
+              cleanVal[prop] = val[prop];
+            }
+          }
+          
+          if (val.autoRefreshSeconds !== undefined) {
+            if (typeof val.autoRefreshSeconds !== 'number' || !Number.isFinite(val.autoRefreshSeconds) || val.autoRefreshSeconds < 5 || val.autoRefreshSeconds > 86400) {
+              throw new Error(`autoRefreshSeconds must be a number between 5 and 86400`);
+            }
+            cleanVal.autoRefreshSeconds = val.autoRefreshSeconds;
+          }
+          
+          validSettings[normKey] = cleanVal;
+        }
+
+        await setStorage({
+          [STORAGE_ENABLED_HOSTS]: [...new Set(validHosts)],
+          [STORAGE_HOST_SETTINGS]: validSettings,
+        });
+        await syncScriptsOnStartup();
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: err.message };
+      }
     }
 
     /* ── Relay: blocked event counts from MAIN world ── */

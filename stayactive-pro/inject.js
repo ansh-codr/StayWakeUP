@@ -46,6 +46,8 @@
   // This prevents the page from intercepting or spoofing SA_CONFIG / BLOCKED_COUNTS.
   const channel = new MessageChannel();
 
+  let currentCfg = null;
+
   channel.port1.onmessage = function onSaConfig(event) {
     if (!event.data || event.data.__saType !== 'SA_CONFIG') return;
 
@@ -56,10 +58,12 @@
       return;
     }
 
+    currentCfg = cfg;
+
     if (extrasStarted) return;
     extrasStarted = true;
 
-    startExtras(cfg);
+    startExtras();
   };
 
   // Tell relay.js we are ready and pass the secure port.
@@ -82,25 +86,18 @@
     nativeCodeMap.set(fn, nativeStr);
   }
 
-  // Only override toString once, even if this IIFE somehow ran twice.
-  if (!Function.prototype.__saPatched__) {
-    Object.defineProperty(Function.prototype, '__saPatched__', {
-      value: true, writable: false, configurable: false, enumerable: false,
-    });
+  Function.prototype.toString = function toString() {
+    if (nativeCodeMap.has(this)) {
+      return nativeCodeMap.get(this);
+    }
+    return nativeToString.call(this);
+  };
 
-    Function.prototype.toString = function toString() {
-      if (nativeCodeMap.has(this)) {
-        return nativeCodeMap.get(this);
-      }
-      return nativeToString.call(this);
-    };
-
-    // Make our patched toString itself look native.
-    registerNativeString(
-      Function.prototype.toString,
-      'function toString() { [native code] }',
-    );
-  }
+  // Make our patched toString itself look native.
+  registerNativeString(
+    Function.prototype.toString,
+    'function toString() { [native code] }',
+  );
 
   /* ─────────────────────────────────────────────────────────────────
    * 3. Override visibility getters on Document.prototype.
@@ -247,111 +244,117 @@
    * These depend on user-configured options and must NOT run until
    * config is known.  They are safe to skip entirely if both are off.
    * ───────────────────────────────────────────────────────────────── */
-  function startExtras(cfg) {
-    // Verification hook — remove after confirming fix works.
-    console.debug('[StayActive] extras started', cfg);
-
+  function startExtras() {
     /* ───────────────────────────────────────────────────────────────
-     * 7. Anti-idle / fake activity  (cfg.antiIdle || cfg.fakeActivity)
-     *
-     *    Dispatches synthetic mousemove + scroll on a random 20–40 s
-     *    interval so the OS/browser idle timer does not tick up.
-     *    Requests a Screen Wake Lock and re-acquires it when released.
+     * 7. Anti-idle / fake activity
      * ─────────────────────────────────────────────────────────────── */
-    if (cfg.antiIdle || cfg.fakeActivity) {
-      function randomBetween(min, max) {
-        return Math.floor(Math.random() * (max - min + 1)) + min;
+    let fakeActivityTimer = null;
+
+    function randomBetween(min, max) {
+      return Math.floor(Math.random() * (max - min + 1)) + min;
+    }
+
+    function dispatchFakeActivity() {
+      if (!currentCfg || (!currentCfg.antiIdle && !currentCfg.fakeActivity)) {
+        fakeActivityTimer = null;
+        return;
       }
 
-      function dispatchFakeActivity() {
-        try {
-          // Synthetic mousemove — will NOT re-trigger our block handler
-          // because event.target is document.body, not window/document/<html>.
-          const mv = new MouseEvent('mousemove', {
-            bubbles: true, cancelable: true,
-            clientX: randomBetween(1, 10), clientY: randomBetween(1, 10),
-          });
-          document.dispatchEvent(mv);
-
-          // Tiny scroll keeps some idle APIs from firing.
-          window.scrollBy(0, 0);
-        } catch (_) {}
-
-        scheduleNextFakeActivity();
-      }
-
-      function scheduleNextFakeActivity() {
-        const delay = randomBetween(20000, 40000);
-        setTimeout(dispatchFakeActivity, delay);
-      }
+      try {
+        const mv = new MouseEvent('mousemove', {
+          bubbles: true, cancelable: true,
+          clientX: randomBetween(1, 10), clientY: randomBetween(1, 10),
+        });
+        document.dispatchEvent(mv);
+        window.scrollBy(0, 0);
+      } catch (_) {}
 
       scheduleNextFakeActivity();
+    }
 
-      /* Screen Wake Lock — re-acquire when released */
-      if ('wakeLock' in navigator) {
-        let wakeLockRef = null;
+    function scheduleNextFakeActivity() {
+      if (!currentCfg || (!currentCfg.antiIdle && !currentCfg.fakeActivity)) return;
+      const delay = randomBetween(20000, 40000);
+      fakeActivityTimer = setTimeout(dispatchFakeActivity, delay);
+    }
 
-        async function acquireWakeLock() {
-          try {
-            wakeLockRef = await navigator.wakeLock.request('screen');
-            wakeLockRef.addEventListener('release', acquireWakeLock);
-          } catch (_) {
-            // Silently fail — wake lock is optional enhancement.
+    scheduleNextFakeActivity();
+
+    /* Screen Wake Lock */
+    if ('wakeLock' in navigator) {
+      let wakeLockRef = null;
+
+      async function acquireWakeLock() {
+        if (!currentCfg || (!currentCfg.antiIdle && !currentCfg.fakeActivity)) {
+          if (wakeLockRef) {
+            wakeLockRef.release().catch(() => {});
+            wakeLockRef = null;
           }
+          return;
         }
-
-        // Wake Lock requires a user gesture on some browsers; try immediately
-        // and also on first interaction.
-        acquireWakeLock();
-        document.addEventListener('click', acquireWakeLock, { once: true });
-      }
-
-      /* Spoof Idle Detection API if present */
-      if (typeof IdleDetector !== 'undefined') {
+        if (wakeLockRef !== null && !wakeLockRef.released) return;
         try {
-          const OrigIdleDetector = IdleDetector;
-          class SpoofedIdleDetector extends OrigIdleDetector {
-            get userState()   { return 'active'; }
-            get screenState() { return 'unlocked'; }
-          }
-          window.IdleDetector = SpoofedIdleDetector;
-        } catch (_) {}
+          wakeLockRef = await navigator.wakeLock.request('screen');
+          wakeLockRef.addEventListener('release', () => {
+            wakeLockRef = null;
+          }, { once: true });
+        } catch (_) {
+          wakeLockRef = null;
+        }
       }
+
+      acquireWakeLock();
+      document.addEventListener('click', acquireWakeLock, { capture: true, passive: true });
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') acquireWakeLock();
+      }, { capture: true, passive: true });
+    }
+
+    /* Spoof Idle Detection API if present */
+    if (typeof IdleDetector !== 'undefined') {
+      try {
+        const OrigIdleDetector = IdleDetector;
+        class SpoofedIdleDetector extends OrigIdleDetector {
+          get userState()   { return 'active'; }
+          get screenState() { return 'unlocked'; }
+        }
+        window.IdleDetector = SpoofedIdleDetector;
+      } catch (_) {}
     }
 
     /* ───────────────────────────────────────────────────────────────
-     * 8. Silent audio keep-alive  (cfg.keepAliveAudio)
-     *
-     *    An oscillator running at gain 0 is enough to signal "active
-     *    audio" to Chrome's background throttling heuristic without
-     *    producing audible sound.
-     *
-     *    WHY: Chrome aggressively throttles setTimeout/setInterval in
-     *    hidden tabs unless audio is playing.  Gain-0 audio tricks it.
+     * 8. Silent audio keep-alive
      * ─────────────────────────────────────────────────────────────── */
-    if (cfg.keepAliveAudio) {
-      let audioCtx = null;
+    let audioCtx = null;
+    let osc = null;
 
-      function startSilentAudio() {
+    function ensureAudioState() {
+      const wantAudio = currentCfg && currentCfg.keepAliveAudio;
+      if (wantAudio && !audioCtx) {
         try {
-          audioCtx = new AudioContext();
-          const osc  = audioCtx.createOscillator();
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
           const gain = audioCtx.createGain();
-          gain.gain.value = 0;           // Completely silent.
-          osc.connect(gain);
+          gain.gain.value = 0;
           gain.connect(audioCtx.destination);
+
+          osc = audioCtx.createOscillator();
+          osc.type = 'sine';
+          osc.frequency.value = 1;
+          osc.connect(gain);
           osc.start();
-
-          // If autoplay policy suspends the context, resume on first interaction.
-          if (audioCtx.state === 'suspended') {
-            document.addEventListener('click', () => audioCtx.resume(), { once: true });
-          }
         } catch (_) {}
+      } else if (!wantAudio && audioCtx) {
+        try {
+          if (osc) osc.stop();
+          audioCtx.close().catch(() => {});
+        } catch (_) {}
+        audioCtx = null;
+        osc = null;
       }
-
-      // Defer slightly so the page has a chance to load its own AudioContext first.
-      setTimeout(startSilentAudio, 500);
     }
-  } // end startExtras
+
+    setTimeout(ensureAudioState, 500);
+    document.addEventListener('click', ensureAudioState, { capture: true, passive: true });
+  }
 
 })();

@@ -82,7 +82,9 @@ async function loadSites() {
   tbody.querySelectorAll('.remove-btn').forEach(btn => {
     btn.addEventListener('click', async () => {
       const hostname = btn.dataset.hostname;
-      if (!confirm(`Disable StayActive Pro for "${hostname}"?`)) return;
+      if (!confirm(`Remove StayActive Pro for "${hostname}"?`)) return;
+
+      btn.disabled = true;
 
       // Find any tab with this hostname to pass tabId (best-effort).
       let tabId = null;
@@ -97,12 +99,13 @@ async function loadSites() {
         }
       } catch (_) {}
 
-      const resp = await sendMsg({ type: 'DISABLE_SITE', hostname, tabId });
+      const resp = await sendMsg({ type: 'REMOVE_SITE', hostname, tabId });
       if (resp && resp.ok) {
-        showSuccess(`${hostname} disabled.`);
+        showSuccess(`${hostname} removed.`);
         await loadSites();
       } else {
-        showError(resp?.error || 'Failed to disable site.');
+        btn.disabled = false;
+        showError(resp?.error || 'Failed to remove site.');
       }
     });
   });

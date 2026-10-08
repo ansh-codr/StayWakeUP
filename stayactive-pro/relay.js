@@ -129,4 +129,22 @@
     postConfig(cfg);
   })();
 
+  /* ─────────────────────────────────────────────────────────────────
+   * Dynamic config updates
+   * ───────────────────────────────────────────────────────────────── */
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.hostSettings) {
+      const hostname = location.hostname;
+      const hostSettings = changes.hostSettings.newValue || {};
+      const s = hostSettings[hostname] || {};
+      const cfg = {
+        antiIdle:       !!s.antiIdle,
+        keepAliveAudio: !!s.keepAliveAudio,
+        fakeActivity:   !!s.fakeActivity,
+      };
+      cachedCfg = cfg;
+      postConfig(cfg);
+    }
+  });
+
 })();

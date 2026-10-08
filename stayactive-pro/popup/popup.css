@@ -280,6 +280,21 @@ body {
   outline-offset: 2px;
 }
 
+.switch input:disabled + .slider {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.tool-row.disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.number-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* ── Divider ── */
 .divider {
   height: 1px;

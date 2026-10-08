@@ -156,10 +156,20 @@ function render() {
   UI.keepAudio.checked = !!(settings && settings.keepAliveAudio);
   UI.autoRefresh.checked = !!(settings && settings.autoRefresh);
 
+  const disabledState = !enabled;
+  UI.antiIdle.disabled = disabledState;
+  UI.keepAudio.disabled = disabledState;
+  UI.autoRefresh.disabled = disabledState;
+  
+  UI.antiIdle.closest('.tool-row').classList.toggle('disabled', disabledState);
+  UI.keepAudio.closest('.tool-row').classList.toggle('disabled', disabledState);
+  UI.autoRefresh.closest('.tool-row').classList.toggle('disabled', disabledState);
+
   // Refresh interval.
   if (settings && settings.autoRefreshSeconds) {
     UI.refreshSeconds.value = settings.autoRefreshSeconds;
   }
+  UI.refreshSeconds.disabled = disabledState || !UI.autoRefresh.checked;
 
   // Show/hide refresh config.
   UI.refreshConfig.classList.toggle('hidden', !(settings && settings.autoRefresh));
@@ -322,19 +332,26 @@ UI.extraToolsToggle.addEventListener('click', () => {
 });
 
 /* Tool toggles */
-UI.antiIdle.addEventListener('change', () =>
-  updateSetting({ antiIdle: UI.antiIdle.checked }));
+UI.antiIdle.addEventListener('change', () => {
+  if (!state.enabled) return;
+  updateSetting({ antiIdle: UI.antiIdle.checked });
+});
 
-UI.keepAudio.addEventListener('change', () =>
-  updateSetting({ keepAliveAudio: UI.keepAudio.checked }));
+UI.keepAudio.addEventListener('change', () => {
+  if (!state.enabled) return;
+  updateSetting({ keepAliveAudio: UI.keepAudio.checked });
+});
 
 UI.autoRefresh.addEventListener('change', async () => {
+  if (!state.enabled) return;
   const on = UI.autoRefresh.checked;
   UI.refreshConfig.classList.toggle('hidden', !on);
+  UI.refreshSeconds.disabled = !on;
   await updateSetting({ autoRefresh: on });
 });
 
 UI.refreshSeconds.addEventListener('change', () => {
+  if (!state.enabled) return;
   const secs = Math.max(5, parseInt(UI.refreshSeconds.value, 10) || 60);
   UI.refreshSeconds.value = secs;
   updateSetting({ autoRefreshSeconds: secs });
